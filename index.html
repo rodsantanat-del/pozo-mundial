@@ -270,7 +270,7 @@ const API_URL = "https://script.google.com/macros/s/AKfycbxhN57pc5bqeUqJFEHjWaM5
 
 const configurado = API_URL && API_URL.indexOf('PEGA_AQUI') === -1;
 let ROOM = (localStorage.getItem('pozoRoom') || 'amigos').toLowerCase();
-let lastJson = '', pushTimer = null, pollTimer = null;
+let lastJson = '', pushTimer = null, pollTimer = null, dirty = false, pushing = false;
 
 let state = { players:[], matches:[], scorers:[] };
 const MONTOS = [500,1000,2000];
@@ -321,13 +321,14 @@ function isLocked(m){ return !m.unlock && m.date < todayStr && m.result===null; 
 function setConn(t){ const el=document.getElementById('connStatus'); if(el) el.textContent=t; }
 
 async function pullOnce(){
+ if(dirty || pushing){ setConn('🟢 Conectado · sala "'+ROOM+'" · (cambios sin guardar)'); return true; }
  try{
   const res = await fetch(API_URL + '?room=' + encodeURIComponent(ROOM) + '&t=' + Date.now());
   const data = await res.json();
   if(data && data.ok){
    const incoming = data.state || { players:[], matches:buildFixture(), scorers:[] };
    const incJson = JSON.stringify(incoming);
-   if(incJson !== JSON.stringify(state)){
+   if(incJson !== lastJson && incJson !== JSON.stringify(state)){
     state = incoming;
     if(!state.scorers) state.scorers=[];
     if(!state.players) state.players=[];
@@ -343,18 +344,22 @@ async function pullOnce(){
 }
 
 async function pushNow(){
+ pushing = true;
  try{
   setConn('💾 Guardando...');
-  await fetch(API_URL, { method:'POST', headers:{'Content-Type':'text/plain;charset=utf-8'}, body: JSON.stringify({room:ROOM, state:state}) });
+  await fetch(API_URL, { method:'POST', mode:'no-cors', headers:{'Content-Type':'text/plain;charset=utf-8'}, body: JSON.stringify({room:ROOM, state:state}) });
   lastJson = JSON.stringify(state);
+  dirty = false;
   setConn('🟢 Guardado · sala "'+ROOM+'"');
- }catch(e){ console.error(e); setConn('⚠️ No se pudo guardar (revisa conexión/URL).'); }
+ }catch(e){ console.error(e); setConn('⚠️ No se pudo guardar; reintentando...'); clearTimeout(pushTimer); pushTimer = setTimeout(pushNow, 3000); }
+ pushing = false;
 }
 
 function saveData(){
  if(!configurado){ localStorage.setItem('pozoLocalTmp', JSON.stringify(state)); return; }
+ dirty = true;
  clearTimeout(pushTimer);
- pushTimer = setTimeout(pushNow, 600);
+ pushTimer = setTimeout(pushNow, 500);
 }
 
 function changeRoom(){
@@ -469,8 +474,8 @@ window._openGroups={A:true};
 function toggleGroup(g){ window._openGroups[g]=!window._openGroups[g]; renderGrupos(); }
 function renderGrupos(){
  const list=document.getElementById('gruposList');
- if(state.players.length===0){ list.innerHTML='<div class="empty-state">👥 Primero agrega jugadores</div>'; return; }
- let html=''; Object.keys(grupos).forEach(g=>{ const ms=state.matches.filter(m=>m.phase==='Grupos'&&m.group===g); const open=window._openGroups&&window._openGroups[g]; html+=`<div class="group-card"><div class="group-head" onclick="toggleGroup('${g}')"><div><div class="group-title">Grupo ${g}</div><div class="group-teams">${grupos[g].join(' · ')}</div></div><span>${open?'▲':'▼'}</span></div><div class="group-body ${open?'open':''}">${ms.map(matchCardHTML).join('')}</div></div>`; }); list.innerHTML=html;
+ const aviso = state.players.length===0 ? '<div class="empty-state" style="margin-bottom:8px">👥 Agrega jugadores (pestaña Jug.) para poder apostar. Igual puedes ver el fixture abajo.</div>' : '';
+ let html=aviso; Object.keys(grupos).forEach(g=>{ const ms=state.matches.filter(m=>m.phase==='Grupos'&&m.group===g); const open=window._openGroups&&window._openGroups[g]; html+=`<div class="group-card"><div class="group-head" onclick="toggleGroup('${g}')"><div><div class="group-title">Grupo ${g}</div><div class="group-teams">${grupos[g].join(' · ')}</div></div><span>${open?'▲':'▼'}</span></div><div class="group-body ${open?'open':''}">${ms.map(matchCardHTML).join('')}</div></div>`; }); list.innerHTML=html;
 }
 function renderElim(){
  const list=document.getElementById('elimList');
