@@ -231,6 +231,10 @@ const API_URL = "https://script.google.com/macros/s/AKfycbxhN57pc5bqeUqJFEHjWaM5
 const configurado = API_URL && API_URL.indexOf('PEGA_AQUI') === -1;
 let ROOM = (localStorage.getItem('pozoRoom') || 'amigos').toLowerCase();
 let lastJson = '', pushTimer = null, pollTimer = null, dirty = false, pushing = false;
+let knownPlayerCount = 0; // marca de agua: maximo de jugadores visto (anti-borrado)
+function pc(s){ return (s && Array.isArray(s.players)) ? s.players.length : 0; }
+let lastLocalEditTs = 0; const EDIT_GRACE_MS = 12000; // protege ediciones recientes del auto-refresh
+function cleanState(st){ return JSON.parse(JSON.stringify(st, function(k,v){ return (k && k.charAt(0)==='_') ? undefined : v; })); }
 
 let state = { players:[], matches:[], scorers:[] };
 const now = new Date();
@@ -361,8 +365,17 @@ function ensureFixture(){
  if(state && state.fixtureVersion === FIXTURE_VERSION) return false;
  const players = state.players || [];
  const scorers = state.scorers || [];
+ // Guardar apuestas y resultados previos por id de partido (los ids son estables)
+ const oldBets = {}, oldRes = {};
+ (state.matches||[]).forEach(m=>{ if(m && m.id){ oldBets[m.id]=m.bets||{}; oldRes[m.id]={result:m.result,scoreHome:m.scoreHome,scoreAway:m.scoreAway}; } });
  state.matches = buildFixture();
- players.forEach(p=> state.matches.forEach(m=>{ m.bets[p.id]=emptyBet(); }));
+ state.matches.forEach(m=>{
+  const prev = oldBets[m.id] || {};
+  m.bets = {};
+  players.forEach(p=>{ m.bets[p.id] = prev[p.id] || emptyBet(); });
+  const r = oldRes[m.id];
+  if(r && r.result!==null && r.result!==undefined){ m.result=r.result; m.scoreHome=r.scoreHome; m.scoreAway=r.scoreAway; }
+ });
  state.players = players;
  state.scorers = scorers;
  state.fixtureVersion = FIXTURE_VERSION;
@@ -372,19 +385,31 @@ function ensureFixture(){
 function setConn(t){ const el=document.getElementById('connStatus'); if(el) el.textContent=t; }
 
 async function pullOnce(force){
- if(!force && (dirty || pushing)){ setConn('🟢 Conectado · sala "'+ROOM+'" · (cambios sin guardar)'); return true; }
+ if(!force && (dirty || pushing || (Date.now()-lastLocalEditTs < EDIT_GRACE_MS))){ setConn('🟢 Conectado · sala "'+ROOM+'" · (cambios recientes protegidos)'); return true; }
  try{
   const res = await fetch(API_URL + '?room=' + encodeURIComponent(ROOM) + '&t=' + Date.now());
   const data = await res.json();
   if(data && data.ok){
-   const incoming = data.state || { players:[], matches:buildFixture(), scorers:[] };
+   const incoming = data.state || null;
+   // DEFENSA 1: respuesta sin datos validos -> ignorar, no tocar lo local
+   if(!incoming || !Array.isArray(incoming.matches) || !incoming.matches.length){
+    setConn('🟡 Conectado · respuesta vacía del servidor ignorada (datos locales intactos)');
+    return true;
+   }
+   // DEFENSA 2: el servidor llega con 0 jugadores pero nosotros (o el historial) ya teniamos -> NO adoptar y re-sanar
+   if(pc(incoming)===0 && (pc(state)>0 || knownPlayerCount>0)){
+    setConn('🛡️ Conectado · ignorada actualización vacía del servidor (protegiendo datos)');
+    if(pc(state)>0){ dirty=true; clearTimeout(pushTimer); pushTimer=setTimeout(pushNow,800); }
+    return true;
+   }
    const incJson = JSON.stringify(incoming);
-   if(incJson !== JSON.stringify(state)){
+   if(incJson !== JSON.stringify(cleanState(state))){
     state = incoming;
     if(!state.scorers) state.scorers=[];
     if(!state.players) state.players=[];
     if(!state.matches || !state.matches.length){ state.matches=buildFixture(); state.fixtureVersion=FIXTURE_VERSION; }
     const migrated = ensureFixture();
+    if(pc(state)>0){ knownPlayerCount=Math.max(knownPlayerCount, pc(state)); try{ localStorage.setItem('pozoKPC_'+ROOM, String(knownPlayerCount)); localStorage.setItem('pozoBackup_'+ROOM, JSON.stringify(state)); }catch(e){} }
     lastJson = JSON.stringify(state);
     renderAll();
     if(migrated){ pushNow(); }
@@ -397,17 +422,28 @@ async function pullOnce(force){
 }
 
 async function pushNow(){
+ // DEFENSA 3: nunca escribir un estado vacio si alguna vez hubo jugadores
+ if(pc(state)===0 && knownPlayerCount>0){
+  setConn('🛡️ Bloqueado: no se envía un estado vacío (datos protegidos)');
+  dirty=false; pushing=false; return;
+ }
  pushing = true;
  try{
   setConn('💾 Guardando...');
-  await fetch(API_URL, { method:'POST', mode:'no-cors', headers:{'Content-Type':'text/plain;charset=utf-8'}, body: JSON.stringify({room:ROOM, state:state}) });
+  await fetch(API_URL, { method:'POST', mode:'no-cors', headers:{'Content-Type':'text/plain;charset=utf-8'}, body: JSON.stringify({room:ROOM, state:cleanState(state)}) });
   lastJson = JSON.stringify(state); dirty = false;
   setConn('🟢 Guardado · sala "'+ROOM+'"');
  }catch(e){ console.error(e); setConn('⚠️ No se pudo guardar; reintentando...'); clearTimeout(pushTimer); pushTimer=setTimeout(pushNow,3000); }
  pushing = false;
 }
 
-function saveData(){ if(!configurado){ localStorage.setItem('pozoLocalTmp', JSON.stringify(state)); return; } dirty=true; clearTimeout(pushTimer); pushTimer=setTimeout(pushNow,500); }
+function saveData(){
+ // DEFENSA 4: respaldo local de este equipo + actualizar marca de agua
+ lastLocalEditTs=Date.now();
+ try{ if(pc(state)>0){ knownPlayerCount=Math.max(knownPlayerCount, pc(state)); localStorage.setItem('pozoKPC_'+ROOM, String(knownPlayerCount)); localStorage.setItem('pozoBackup_'+ROOM, JSON.stringify(cleanState(state))); } }catch(e){}
+ if(!configurado){ localStorage.setItem('pozoLocalTmp', JSON.stringify(state)); return; }
+ dirty=true; clearTimeout(pushTimer); pushTimer=setTimeout(pushNow,500);
+}
 
 async function forceRefresh(){
  setConn('🔄 Actualizando...');
@@ -428,23 +464,34 @@ async function loadData(){
   renderAll(); return;
  }
  setConn('🔄 Conectando con Google...');
+ // sembrar marca de agua desde respaldo local antes de sincronizar
+ try{ knownPlayerCount = parseInt(localStorage.getItem('pozoKPC_'+ROOM)||'0',10) || 0; }catch(e){ knownPlayerCount=0; }
  await pullOnce(true);
+ // RECUPERACION: si el servidor vino vacio pero este equipo tiene respaldo con jugadores, restaurar y re-subir
+ if(pc(state)===0){
+  try{
+   const bk=localStorage.getItem('pozoBackup_'+ROOM);
+   if(bk){ const b=JSON.parse(bk); if(pc(b)>0){ state=b; if(!state.scorers)state.scorers=[]; ensureFixture(); knownPlayerCount=Math.max(knownPlayerCount, pc(state)); renderAll(); dirty=true; clearTimeout(pushTimer); pushTimer=setTimeout(pushNow,500); setConn('🛟 Restaurado desde respaldo local de este equipo'); }
+   }
+  }catch(e){}
+ }
  if(!state || !state.matches || !state.matches.length){ state={players:[],matches:buildFixture(),scorers:[],fixtureVersion:FIXTURE_VERSION}; renderAll(); }
  if(pollTimer) clearInterval(pollTimer);
  pollTimer = setInterval(()=>pullOnce(false), 8000);
 }
 
-function addPlayer(){ const i=document.getElementById('playerName'); const n=i.value.trim(); if(n){ const pl={id:Date.now(),name:n}; state.players.push(pl); state.matches.forEach(m=>m.bets[pl.id]=emptyBet()); i.value=''; saveData(); renderAll(); } }
+function addPlayer(){ const i=document.getElementById('playerName'); const n=i.value.trim(); if(n){ const pl={id:Date.now(),name:n}; state.players.push(pl); state.matches.forEach(m=>m.bets[pl.id]=emptyBet()); knownPlayerCount=Math.max(knownPlayerCount, pc(state)); i.value=''; saveData(); renderAll(); } }
 function deletePlayer(id){ state.players=state.players.filter(p=>p.id!==id); state.matches.forEach(m=>delete m.bets[id]); saveData(); renderAll(); }
 function setBetOutcome(mid,pid,o){ const m=state.matches.find(x=>x.id===mid); if(m&&m.result===null&&!isLocked(m)){ if(!m.bets[pid])m.bets[pid]=emptyBet(); if(m.bets[pid].locked) return; m.bets[pid].outcome=o; saveData(); renderAll(); } }
 function setBetPred(mid,pid,side,v){ const m=state.matches.find(x=>x.id===mid); if(m&&m.result===null&&!isLocked(m)){ if(!m.bets[pid])m.bets[pid]=emptyBet(); if(m.bets[pid].locked) return; if(side==='home')m.bets[pid].predHome=v; else m.bets[pid].predAway=v; saveData(); } }
 function lockBet(mid,pid){ const m=state.matches.find(x=>x.id===mid); if(!m||m.result!==null||isLocked(m))return; const b=m.bets[pid]; if(!b||!b.outcome){ alert('Primero elige el ganador o empate'); return; } b.locked=true; saveData(); renderAll(); }
 function unlockBet(mid,pid){ const m=state.matches.find(x=>x.id===mid); if(!m||m.result!==null||isLocked(m))return; if(m.bets[pid]) m.bets[pid].locked=false; saveData(); renderAll(); }
-function toggleResult(mid){ const m=state.matches.find(x=>x.id===mid); if(m){ m._showRes=!m._showRes; renderAll(); } }
+function toggleResult(mid){ const m=state.matches.find(x=>x.id===mid); if(m){ m._showRes=!m._showRes; if(m._showRes){ m._draftHome=(m.scoreHome!=null?String(m.scoreHome):'0'); m._draftAway=(m.scoreAway!=null?String(m.scoreAway):'0'); lastLocalEditTs=Date.now(); } renderAll(); } }
+function setDraftScore(mid,side,v){ const m=state.matches.find(x=>x.id===mid); if(!m) return; if(side==='home') m._draftHome=v; else m._draftAway=v; lastLocalEditTs=Date.now(); }
 function toggleUnlock(mid){ const m=state.matches.find(x=>x.id===mid); if(m){ m.unlock=!m.unlock; saveData(); renderAll(); } }
 function renameMatch(mid){ const m=state.matches.find(x=>x.id===mid); if(!m)return; const nuevo=prompt('Nombre del partido (usa "vs"):',m.teams); if(nuevo&&nuevo.trim()){ m.teams=nuevo.trim(); saveData(); renderAll(); } }
 function watchGoals(teams){ window.open('https://www.youtube.com/results?search_query='+encodeURIComponent(teams+' goles resumen Mundial 2026'),'_blank'); }
-function confirmResult(mid){ const m=state.matches.find(x=>x.id===mid); const gh=parseInt(document.getElementById('gh_'+mid).value); const ga=parseInt(document.getElementById('ga_'+mid).value); if(isNaN(gh)||isNaN(ga)){ alert('Ingresa ambos marcadores'); return; } if(m&&m.result===null){ m.scoreHome=gh; m.scoreAway=ga; m.result=gh>ga?'1':(gh===ga?'X':'2'); m._showRes=false; saveData(); renderAll(); } }
+function confirmResult(mid){ const m=state.matches.find(x=>x.id===mid); if(!m) return; const ghEl=document.getElementById('gh_'+mid), gaEl=document.getElementById('ga_'+mid); const gh=parseInt(ghEl?ghEl.value:m._draftHome); const ga=parseInt(gaEl?gaEl.value:m._draftAway); if(isNaN(gh)||isNaN(ga)||gh<0||ga<0){ alert('Ingresa ambos marcadores (números válidos, 0 o más)'); return; } m.scoreHome=gh; m.scoreAway=ga; m.result=gh>ga?'1':(gh===ga?'X':'2'); m._showRes=false; delete m._draftHome; delete m._draftAway; saveData(); renderAll(); }
 
 function computeStats(){
  const stats={};
@@ -471,11 +518,11 @@ function matchCardHTML(m){
  let acts='';
  if(m.result===null&&!locked)acts+=`<button class="small-button" onclick="toggleResult('${m.id}')">🎯</button>`;
  if(m.result===null&&locked)acts+=`<button class="small-button" onclick="toggleUnlock('${m.id}')">🔓</button>`;
- if(m.result!==null)acts+=`<button class="small-button" style="background:#43a047;color:white;border-color:#43a047" disabled>✓</button>`;
+ if(m.result!==null)acts+=`<button class="small-button" style="background:#43a047;color:white;border-color:#43a047" onclick="toggleResult('${m.id}')" title="Corregir resultado">✓✏️</button>`;
  acts+=`<button class="small-button vid-btn" onclick="watchGoals('${t.home} vs ${t.away}')">📺</button>`;
  acts+=`<button class="small-button" onclick="renameMatch('${m.id}')">✏️</button>`;
  let body='';
- if(m._showRes&&m.result===null){ body+=`<div class="result-selector"><label>Marcador final:</label><div class="score-inputs"><span>${t.home}</span><input type="number" id="gh_${m.id}" min="0" value="0"><span>-</span><input type="number" id="ga_${m.id}" min="0" value="0"><span>${t.away}</span></div><button class="primary small-button" onclick="confirmResult('${m.id}')">✓ Confirmar y calcular</button></div>`; }
+ if(m._showRes){ const dh=(m._draftHome!=null?m._draftHome:(m.scoreHome!=null?m.scoreHome:0)); const da=(m._draftAway!=null?m._draftAway:(m.scoreAway!=null?m.scoreAway:0)); body+=`<div class="result-selector"><label>Marcador final${m.result!==null?' (corrigiendo)':''}:</label><div class="score-inputs"><span>${t.home}</span><input type="number" id="gh_${m.id}" min="0" value="${dh}" oninput="setDraftScore('${m.id}','home',this.value)"><span>-</span><input type="number" id="ga_${m.id}" min="0" value="${da}" oninput="setDraftScore('${m.id}','away',this.value)"><span>${t.away}</span></div><button class="primary small-button" onclick="confirmResult('${m.id}')">✓ Confirmar y calcular</button> <button class="small-button" onclick="toggleResult('${m.id}')">Cancelar</button></div>`; }
  body+=state.players.map(player=>{
    const bet=m.bets[player.id]||emptyBet();
    const finished=m.result!==null;
